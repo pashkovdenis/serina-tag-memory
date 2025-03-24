@@ -1,6 +1,7 @@
 ﻿using Microsoft.Extensions.DependencyInjection;
 using Serina.Semantic.Ai.Pipelines.Filters;
 using Serina.Semantic.Ai.Pipelines.SemanticKernel;
+using Serina.Semantic.Ai.Pipelines.SemanticKernel.Reducers;
 using Serina.Semantic.Ai.Pipelines.Steps.Chat;
 using Serina.Semantic.Ai.Pipelines.Utils;
  
@@ -75,12 +76,16 @@ namespace Serina.TagMemory
                                                EngineType = (int)_config.EngineType
                                          }
                                         }
-                                    })
+                                    }) 
+
                                     .AddFilter(new ClearTextFilter())
                                     .AddFilter(new TextChunkerFilter())
-                                   
+                                    
+                                    .AddReducer(new PairedSlidingWindowReducer())
                                     .AttachKernel()
+                                    
                                     .WithName(SqlGeneratorAgentName)
+                                    
                                     .Build();
 
 
@@ -99,6 +104,7 @@ namespace Serina.TagMemory
                                       }
                                   })
                                   .AttachKernel()
+                                  .AddReducer(new PairedSlidingWindowReducer())
                                   .WithName(SqlRefinerAgentName)
                                   .Build();
 

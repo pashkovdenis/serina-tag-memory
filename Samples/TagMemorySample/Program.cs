@@ -21,8 +21,8 @@ namespace TagMemorySample
 
                 .AddSingleton(new MemoryConfig
                 {
-                    ModelName = "mistral",
-                    Endpoint = "http://127.0.0.1:11434",
+                    ModelName = "dolphin-llama3:8b",
+                    Endpoint = "http://192.168.88.104:11434",
                     EngineType = EngineType.Ollama, 
                     EngineTypeDescription = "This is SQLServer use T-SQL syntax",
                      ScanSchema = true,

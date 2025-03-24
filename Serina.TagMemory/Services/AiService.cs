@@ -1,4 +1,5 @@
-﻿using Serina.Semantic.Ai.Pipelines.Models;
+﻿using Polly;
+using Serina.Semantic.Ai.Pipelines.Models;
 using Serina.Semantic.Ai.Pipelines.Utils;
 using Serina.Semantic.Ai.Pipelines.ValueObject;
 using Serina.TagMemory.Interfaces;
@@ -6,6 +7,7 @@ using Serina.TagMemory.Models;
 using System.Diagnostics;
 using System.Text;
 using System.Text.Json;
+using System.Text.RegularExpressions;
 
 namespace Serina.TagMemory.Services
 {
@@ -19,7 +21,12 @@ namespace Serina.TagMemory.Services
         private const string SqlGeneratorAgentName = "SqlGenerator";
         private const string SqlRefinerAgentName = "SqlRefiner";
 
-        private static Dictionary<int, string> _cache = new();
+        public int RetryFixCount { get; set; } = 10;  
+
+
+        private readonly List<RequestMessage> _generatorHistory = new(); 
+        private readonly List<RequestMessage> _refinerHistory = new();
+
 
         public AiService(MemoryConfig config,
             ISchemaScanner schemaScanner,
@@ -32,11 +39,7 @@ namespace Serina.TagMemory.Services
 
         public async Task<string> TransformInputToSqlAsync(string input)
         {
-            if (_cache.ContainsKey(input.GetHashCode()))
-            {
-                return _cache[input.GetHashCode()];
-            }
-
+            
             var schema_information = new StringBuilder();
 
             if (_config.Examples.Any())
@@ -105,6 +108,16 @@ Provide only the final SQL query in a clean and executable format.
 
             var pipeline = PipelineRegistry.Get(SqlGeneratorAgentName);
 
+
+            if (!_generatorHistory.Any())
+            {
+                _generatorHistory.Add(new RequestMessage(systemPromptTrasnformer, MessageRole.System, Guid.NewGuid())); 
+
+            }
+
+            _generatorHistory.Add(new RequestMessage(input, MessageRole.User, Guid.NewGuid())); 
+
+
             var context = new PipelineContext
             {
                 AutoFunction = false,
@@ -113,13 +126,7 @@ Provide only the final SQL query in a clean and executable format.
                 RequestMessage = new RequestMessage(systemPromptTrasnformer, MessageRole.System, Guid.NewGuid())
                 {
                     Temperature = 0.1,
-                    History = new List<RequestMessage> {
-                         new RequestMessage(systemPromptTrasnformer, MessageRole.System, Guid.NewGuid()),
-                         new RequestMessage(input, MessageRole.User, Guid.NewGuid())
-
-                    }.ToArray()
-
-
+                    History = _generatorHistory.ToArray() 
                 }
             };
 
@@ -127,34 +134,59 @@ Provide only the final SQL query in a clean and executable format.
 
             var result = context.Response.Content;
 
+            if (result.Contains("<output>"))
+            {
+                var mt = Regex.Match(result, @"<output>(.*?)</output>", RegexOptions.Singleline).Groups[1].Value;
 
+                result = mt;
+            }
 
+            if (result.Contains("```sql"))
+            {
+                result = result.Split("```sql").Last().Split("```").First().Trim();
+            }
+
+            _generatorHistory.Add(new RequestMessage(result, MessageRole.Bot, Guid.NewGuid()));
 
             // try to execute the query :  
             if (!string.IsNullOrEmpty(result))
             {
-
+                _refinerHistory.Clear();
                 IEnumerable<dynamic> objList = default;
 
+                // Define Polly Retry Policy (up to 5 retries)
+                var retryPolicy = Policy
+                    .Handle<Exception>() // Catch any SQL-related exceptions
+                    .WaitAndRetryAsync(RetryFixCount , attempt => TimeSpan.FromSeconds(Math.Pow(2, attempt)), async (exception, timeSpan, attempt, context) =>
+                    {
+                        Console.WriteLine($"Retrying due to SQL Error: {exception.Message} (Attempt {attempt})");
+
+                        // Ask AI to refine query based on error message
+                        result = await RefineSqlQueryAsync(input, result, exception.Message);
+
+
+                    });
+  
                 try
                 {
-                    objList = await _dbConnector.ExecuteQueryAsync(result);
+                    await retryPolicy.ExecuteAsync(async () =>
+                    {
+                        objList = await _dbConnector.ExecuteQueryAsync(result);
+                    });
+
                 }
                 catch (Exception ex)
                 {
                     Debug.WriteLine("Tag error " + ex.Message);
+                    Console.WriteLine("error " + ex.Message);
                     return string.Empty;
                 }
 
+
                 var json = JsonSerializer.Serialize(objList);
 
-                // try to make it more human  
-
                 var response = await HumanizeAsync(json, input);
-
-
-                _cache.Add(input.GetHashCode(), response);
-
+ 
                 return response;
             }
 
@@ -178,7 +210,21 @@ You will receive a JSON data structure and a user question.
 Your task is to analyze the JSON and generate a clear, human-friendly response based on the user's query.  
 If the question requests multiple results (e.g., 'count:10'), ensure you provide the correct number of entries. 
 Do not return a single result unless explicitly asked.
+Provide only short answer max 10 words.
 ";
+
+            if (!_refinerHistory.Any())
+            {
+                _refinerHistory.Add(new RequestMessage(prompt, MessageRole.System, Guid.NewGuid()));
+            }
+
+            _refinerHistory.Add(new RequestMessage(@$"
+                            ***json***
+                            {json}
+                            *** Input ***
+                            {input}
+
+                        ", MessageRole.User, Guid.NewGuid()));
 
             var context = new PipelineContext
             {
@@ -187,18 +233,7 @@ Do not return a single result unless explicitly asked.
                 RequestMessage = new RequestMessage(prompt, MessageRole.System, Guid.NewGuid())
                 {
 
-                    History = new List<RequestMessage> {
-                         new RequestMessage(prompt, MessageRole.System, Guid.NewGuid()),
-                         new RequestMessage(@$"
-                            ***json***
-                            {json}
-                            *** Input ***
-                            {input}
-
-                        ", MessageRole.User, Guid.NewGuid())
-
-                    }.ToArray()
-
+                    History = _refinerHistory.ToArray() 
 
                 }
             };
@@ -206,6 +241,7 @@ Do not return a single result unless explicitly asked.
             await pipeline.ExecuteStepAsync(context, default);
 
             var result = context.Response.Content;
+            _refinerHistory.Add(new RequestMessage(result, MessageRole.Bot, Guid.NewGuid()));
 
 
             return result;
@@ -213,5 +249,88 @@ Do not return a single result unless explicitly asked.
         }
 
 
+
+
+
+
+
+
+        // 🔹 **Function to Refine Query Based on Error**
+        private async Task<string> RefineSqlQueryAsync(string input, string previousQuery, string errorMessage)
+        {
+            var pipeline = PipelineRegistry.Get(SqlRefinerAgentName);
+            
+            var prompt = @$"
+You generated an SQL query, but it caused an error. Your task is to analyze the error and fix the SQL query.
+Think step by step but only keep a minimum draft for each thinking step, with 5 words at most. 
+Pay attention on errors if id then add id or use max id + 1.
+Make the necessary corrections and return only the fixed SQL query. Return only the answer at the end of the response after a separator ```sql  {{response}} ```
+ 
+";
+
+            if (!_refinerHistory.Any())
+            {
+                _refinerHistory.Add(new RequestMessage(prompt, MessageRole.System, Guid.NewGuid()));
+            }
+
+
+            var request = $@"
+            Fix this generated sql: 
+            {previousQuery}
+            according to error: {errorMessage} 
+            user request was : {input}
+
+            ";
+
+            _refinerHistory.Add(new RequestMessage(request, MessageRole.User, Guid.NewGuid()));
+
+            var context = new PipelineContext
+            {
+                AutoFunction = false,
+                EnableFunctions = false,
+                
+                RequestMessage = new RequestMessage("", MessageRole.System, Guid.NewGuid())
+                {
+                    History = _refinerHistory.ToArray(),
+                    Temperature = 0.5
+                }
+            };
+
+            await pipeline.ExecuteStepAsync(context, default);
+            var result = context.Response.Content;
+
+            if (result.Contains("<output>"))
+            {
+                result = Regex.Match(result, @"<output>(.*?)</output>", RegexOptions.Singleline).Groups[1].Value;
+            }
+
+            if (result.Contains("```sql"))
+            {
+                result = result.Split("```sql").Last().Split("```").First().Trim();
+            }
+
+            _refinerHistory.Add(new RequestMessage(result, MessageRole.Bot, Guid.NewGuid()));
+
+            return result;
+        }
+
+
+
+
+
+
+
+
+
+
+
+
+
     }
+
+
+
+
+
+
 }
